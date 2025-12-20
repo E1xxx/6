@@ -198,11 +198,10 @@ client_loop(int csock, unsigned int lines) {
 		"last"
 	};
 
-	FILE		*f;
-	int		 i, j, msgsize;
+	int	i, msgsize;
 	const char	*noun, *verb, *adjective;
-	char		*msg = NULL;
-	ssize_t		 sent = 0, nwritten;
+	char *msg = NULL;
+	ssize_t	sent = 0, nwritten;
 	struct pollfd	 pfd;
 
 	memset(&pfd, 0, sizeof(pfd));
@@ -252,7 +251,7 @@ usage(const char *msg) {
 		fprintf(stderr, "%s\n", msg);
 	name = getprogname();
 	fprintf(stderr, "usage: %s {server|client} unix path\n", name);
-	fprintf(stderr, "       %s {server|client} {inet|inet6} port [address]\n", name);
+	fprintf(stderr, "%s {server|client} {inet|inet6} port [address]\n", name);
 	exit(2);
 }
 
