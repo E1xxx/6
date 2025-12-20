@@ -23,11 +23,17 @@ static void	server_loop(int servsock);
 static void	client_loop(int csock, unsigned int lines);
 static void	usage(const char *msg);
 
-struct client_state {
-	int	 csock;
-	char	*buf;
-	size_t	 bufsize, bufused;
-} *clients;
+struct client_ctx {
+	int fd;
+	FILE *f;
+	char *linebuf;
+	size_t linebufsz;
+	struct client_ctx *next;
+	struct client_ctx *prev;
+};
+
+static struct client_ctx *clients = NULL;
+
 
 
 /*
@@ -47,36 +53,124 @@ proceed_client(FILE *f, const char *name) {
 	/* don't care if there was any error, or just EOF */
 }
 
+static void
+add_client(int fd)
+{
+	struct client_ctx *c = calloc(1, sizeof(*c));
+	if (!c)
+		err(1, "calloc");
+
+	c->fd = fd;
+	c->f = fdopen(fd, "r");
+	if (!c->f)
+		err(1, "fdopen");
+
+	c->next = clients;
+	if (clients)
+		clients->prev = c;
+	clients = c;
+}
+
+static void
+remove_client(struct client_ctx *c)
+{
+	if (c->prev)
+		c->prev->next = c->next;
+	else
+		clients = c->next;
+
+	if (c->next)
+		c->next->prev = c->prev;
+
+	fclose(c->f);
+	close(c->fd);
+	free(c->linebuf);
+	free(c);
+}
+
 /*
  * Accepts clients and proceeds them in protocol-agnostic way.
  */
 void
-server_loop(int servsock) {
-	struct sockaddr_storage	 sas;
-	FILE			*f;
-	socklen_t		 len;
-	int			 csock, cnum = 0;
-	char			 numbuf[20];
+server_loop(int servsock)
+{
+	struct pollfd *pfds = NULL;
+	size_t pfdcount;
+	int nfds, i;
+
+	/* server socket non-blocking */
+	int flags = fcntl(servsock, F_GETFL);
+	fcntl(servsock, F_SETFL, flags | O_NONBLOCK);
 
 	for (;;) {
-		len = sizeof(struct sockaddr_storage);
-		if ((csock = accept(servsock, (struct sockaddr*)&sas, &len)) == -1) {
+		/* 1 server socket + clients */
+		pfdcount = 1;
+		for (struct client_ctx *c = clients; c; c = c->next)
+			pfdcount++;
+
+		pfds = realloc(pfds, sizeof(*pfds) * pfdcount);
+		if (!pfds)
+			err(1, "realloc");
+
+		pfds[0].fd = servsock;
+		pfds[0].events = POLLIN;
+
+		i = 1;
+		for (struct client_ctx *c = clients; c; c = c->next) {
+			pfds[i].fd = c->fd;
+			pfds[i].events = POLLIN;
+			i++;
+		}
+
+		nfds = poll(pfds, pfdcount, -1);
+		if (nfds == -1) {
 			if (errno == EINTR)
 				continue;
-			err(1, "accept");
-			break;
+			err(1, "poll");
 		}
-		if ((f = fdopen(csock, "r+")) == NULL)
-			err(1, "fdopen");
-		cnum++;
-		snprintf(numbuf, sizeof(numbuf), "client %d", cnum);
-		printf("===> %s connected\n", numbuf);
-		proceed_client(f, numbuf);
-		printf("===> %s disconnected\n", numbuf);
-		fclose(f);
-		close(csock);
+
+		/* new connections */
+		if (pfds[0].revents & POLLIN) {
+			for (;;) {
+				int csock = accept(servsock, NULL, NULL);
+				if (csock == -1) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK)
+						break;
+					err(1, "accept");
+				}
+
+				flags = fcntl(csock, F_GETFL);
+				fcntl(csock, F_SETFL, flags | O_NONBLOCK);
+
+				printf("===> client connected\n");
+				add_client(csock);
+			}
+		}
+
+		/* clients */
+		i = 1;
+		struct client_ctx *c = clients;
+		while (c) {
+			struct client_ctx *next = c->next;
+
+			if (pfds[i].revents & POLLIN) {
+				ssize_t n = getline(&c->linebuf,
+				    &c->linebufsz, c->f);
+
+				if (n <= 0) {
+					printf("===> client disconnected\n");
+					remove_client(c);
+				} else {
+					printf("from client: ");
+					fwrite(c->linebuf, n, 1, stdout);
+				}
+			}
+			i++;
+			c = next;
+		}
 	}
 }
+
 
 #define countof(x)	(sizeof(x) / sizeof(x[0]))
 
