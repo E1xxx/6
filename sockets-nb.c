@@ -7,21 +7,15 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <netdb.h>
 #include <poll.h>
-#include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <time.h>
 
-
-/* number of lines to generate on client side */
 static const unsigned int nlines = 10;
-
-static void	proceed_client(FILE *f, const char *name);
-static void	server_loop(int servsock);
-static void	client_loop(int csock, unsigned int lines);
-static void	usage(const char *msg);
 
 struct client_ctx {
 	int fd;
@@ -34,24 +28,11 @@ struct client_ctx {
 
 static struct client_ctx *clients = NULL;
 
-
-
-/*
- * Processes data sent by client until end-of-stream or error.
- */
-void
-proceed_client(FILE *f, const char *name) {
-	char	*line = NULL;
-	size_t	 linesize = 0;
-	ssize_t	 linelen;
-
-	while ((linelen = getline(&line, &linesize, f)) != -1) {
-		printf("from %s: ", name);
-		fwrite(line, linelen, 1, stdout);
-	}
-	free(line);
-	/* don't care if there was any error, or just EOF */
-}
+static void add_client(int fd);
+static void remove_client(struct client_ctx *c);
+static void server_loop(int servsock);
+static void client_loop(int csock, unsigned int lines);
+static void usage(const char *msg);
 
 static void
 add_client(int fd)
@@ -59,12 +40,10 @@ add_client(int fd)
 	struct client_ctx *c = calloc(1, sizeof(*c));
 	if (!c)
 		err(1, "calloc");
-
 	c->fd = fd;
 	c->f = fdopen(fd, "r");
 	if (!c->f)
 		err(1, "fdopen");
-
 	c->next = clients;
 	if (clients)
 		clients->prev = c;
@@ -78,32 +57,24 @@ remove_client(struct client_ctx *c)
 		c->prev->next = c->next;
 	else
 		clients = c->next;
-
 	if (c->next)
 		c->next->prev = c->prev;
-
 	fclose(c->f);
-	close(c->fd);
 	free(c->linebuf);
 	free(c);
 }
 
-/*
- * Accepts clients and proceeds them in protocol-agnostic way.
- */
-void
+static void
 server_loop(int servsock)
 {
 	struct pollfd *pfds = NULL;
-	size_t pfdcount;
-	int nfds, i;
+	size_t pfdcount, i;
+	int nfds, flags;
 
-	/* server socket non-blocking */
-	int flags = fcntl(servsock, F_GETFL);
+	flags = fcntl(servsock, F_GETFL);
 	fcntl(servsock, F_SETFL, flags | O_NONBLOCK);
 
 	for (;;) {
-		/* 1 server socket + clients */
 		pfdcount = 1;
 		for (struct client_ctx *c = clients; c; c = c->next)
 			pfdcount++;
@@ -129,7 +100,6 @@ server_loop(int servsock)
 			err(1, "poll");
 		}
 
-		/* new connections */
 		if (pfds[0].revents & POLLIN) {
 			for (;;) {
 				int csock = accept(servsock, NULL, NULL);
@@ -138,80 +108,65 @@ server_loop(int servsock)
 						break;
 					err(1, "accept");
 				}
-
 				flags = fcntl(csock, F_GETFL);
 				fcntl(csock, F_SETFL, flags | O_NONBLOCK);
-
 				printf("===> client connected\n");
 				add_client(csock);
 			}
 		}
 
-		/* clients */
 		i = 1;
 		struct client_ctx *c = clients;
 		while (c) {
 			struct client_ctx *next = c->next;
-
-			if (pfds[i].revents & POLLIN) {
-				ssize_t n = getline(&c->linebuf,
-				    &c->linebufsz, c->f);
-
-				if (n <= 0) {
-					printf("===> client disconnected\n");
-					remove_client(c);
+			if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+				if (pfds[i].revents & POLLIN) {
+					ssize_t n = getline(&c->linebuf, &c->linebufsz, c->f);
+					if (n <= 0) {
+						printf("===> client disconnected\n");
+						remove_client(c);
+					} else {
+						printf("from client: ");
+						fwrite(c->linebuf, n, 1, stdout);
+					}
 				} else {
-					printf("from client: ");
-					fwrite(c->linebuf, n, 1, stdout);
+					printf("===> client disconnected (error/hup)\n");
+					remove_client(c);
 				}
 			}
 			i++;
 			c = next;
 		}
 	}
+	free(pfds);
 }
 
+#define countof(x) (sizeof(x) / sizeof(x[0]))
 
-#define countof(x)	(sizeof(x) / sizeof(x[0]))
-
-void
-client_loop(int csock, unsigned int lines) {
-	static const char	*nouns[] = {
-		"danger",
-		"security",
-		"table",
-		"picture",
-		"rainbow"
+static void
+client_loop(int csock, unsigned int lines)
+{
+	static const char *nouns[] = {
+		"danger", "security", "table", "picture", "rainbow"
 	};
-	static const char	*verbs[] = {
-		"eats",
-		"sleeps",
-		"invites",
-		"sends",
-		"sees"
+	static const char *verbs[] = {
+		"eats", "sleeps", "invites", "sends", "sees"
 	};
-	static const char	*adjectives[] = {
-		"beautifully",
-		"exclusively",
-		"blue",
-		"funny",
-		"last"
+	static const char *adjectives[] = {
+		"beautifully", "exclusively", "blue", "funny", "last"
 	};
-
-	int	i, msgsize;
-	const char	*noun, *verb, *adjective;
+	int i, msgsize;
+	const char *noun, *verb, *adjective;
 	char *msg = NULL;
-	ssize_t	sent = 0, nwritten;
-	struct pollfd	 pfd;
+	ssize_t sent, nwritten;
+	struct pollfd pfd;
 
+	srand(time(NULL));
 	memset(&pfd, 0, sizeof(pfd));
 	pfd.fd = csock;
 	pfd.events = POLLOUT;
+
 	for (i = 0; i < lines; i++) {
-		/*
-		 * CAUTION in non-fun code you should care about uniform
-		 * distribution; see, e.g., arc4random(3).
-		 */
 		noun = nouns[rand() % countof(nouns)];
 		verb = verbs[rand() % countof(verbs)];
 		adjective = adjectives[rand() % countof(adjectives)];
@@ -222,20 +177,15 @@ client_loop(int csock, unsigned int lines) {
 		sent = 0;
 
 		while (sent < msgsize) {
-			switch (poll(&pfd, 1, -1)) {
-			case -1:
+			if (poll(&pfd, 1, -1) == -1)
 				err(1, "poll");
-				break;
-
-			case 1:
-				nwritten = write(csock, msg + sent, msgsize - sent);
-				if (nwritten == -1)
-					err(1, "write");
-				else
-					sent += nwritten;
-				break;
+			nwritten = write(csock, msg + sent, msgsize - sent);
+			if (nwritten == -1) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					continue;
+				err(1, "write");
 			}
-
+			sent += nwritten;
 		}
 		sleep(1);
 	}
@@ -244,22 +194,24 @@ client_loop(int csock, unsigned int lines) {
 
 #undef countof
 
-void
-usage(const char *msg) {
-	const char	*name;
-	if (msg != NULL)
+static void
+usage(const char *msg)
+{
+	const char *name;
+	if (msg)
 		fprintf(stderr, "%s\n", msg);
 	name = getprogname();
 	fprintf(stderr, "usage: %s {server|client} unix path\n", name);
-	fprintf(stderr, "%s {server|client} {inet|inet6} port [address]\n", name);
+	fprintf(stderr, "       %s {server|client} {inet|inet6} port [address]\n", name);
 	exit(2);
 }
 
 int
-main(int argc, char **argv) {
-	struct sockaddr_storage	ss;
-	socklen_t		slen;
-	int			s, servermode;
+main(int argc, char **argv)
+{
+	struct sockaddr_storage ss;
+	socklen_t slen;
+	int s, servermode;
 
 	if (argc < 4 || argc > 5)
 		usage(NULL);
@@ -271,10 +223,10 @@ main(int argc, char **argv) {
 	else
 		usage("invalid mode, should be either server or client");
 
-	memset(&ss, 0, sizeof(struct sockaddr_storage));
-	if (strcmp(argv[2], "unix") == 0) {
-		struct sockaddr_un	*sun = (struct sockaddr_un*)&ss;
+	memset(&ss, 0, sizeof(ss));
 
+	if (strcmp(argv[2], "unix") == 0) {
+		struct sockaddr_un *sun = (struct sockaddr_un *)&ss;
 		if (argc > 4)
 			usage(NULL);
 		sun->sun_family = AF_UNIX;
@@ -284,56 +236,48 @@ main(int argc, char **argv) {
 		if (servermode)
 			unlink(argv[3]);
 	} else if (strcmp(argv[2], "inet") == 0 || strcmp(argv[2], "inet6") == 0) {
-		int			 port, rv;
-
-		ss.ss_family = ((argv[2][4] == '\0') ? AF_INET : AF_INET6);
+		int port, rv;
+		ss.ss_family = (argv[2][4] == '\0') ? AF_INET : AF_INET6;
 		port = atoi(argv[3]);
 		if (port <= 0 || port > 65535)
 			errx(1, "invalid port: %s", argv[3]);
+
 		if (ss.ss_family == AF_INET) {
-			struct sockaddr_in	*sin = (struct sockaddr_in*)&ss;
+			struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
 			sin->sin_port = htons((uint16_t)port);
 			slen = sizeof(struct sockaddr_in);
 		} else {
-			struct sockaddr_in6	*sin6 = (struct sockaddr_in6*)&ss;
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
 			sin6->sin6_port = htons((uint16_t)port);
 			slen = sizeof(struct sockaddr_in6);
 		}
 
 		if (argc > 4) {
 			if (ss.ss_family == AF_INET) {
-				struct sockaddr_in	*sin = (struct sockaddr_in*)&ss;
+				struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
 				rv = inet_pton(AF_INET, argv[4], &sin->sin_addr);
 			} else {
-				struct sockaddr_in6	*sin6 = (struct sockaddr_in6*)&ss;
+				struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
 				rv = inet_pton(AF_INET6, argv[4], &sin6->sin6_addr);
 			}
 			if (!rv)
 				errx(1, "invalid network address: %s", argv[4]);
-		} else if (servermode) {
-			/*
-			 * Binding to "any" address is done by zeroing address,
-			 * which was already done by memset(3).
-			 */
-		} else {
-			/* connect to local address by default */
-			if (ss.ss_family == AF_INET) {
-				inet_pton(ss.ss_family, "127.0.0.1",
-				    &((struct sockaddr_in*)&ss)->sin_addr);
-			} else {
-				inet_pton(ss.ss_family, "::1",
-				//inet_pton(ss.ss_family, "0000:0000:0000:0000:0000:0000:0000:0001",
-				    &((struct sockaddr_in6*)&ss)->sin6_addr);
-			}
+		} else if (!servermode) {
+			if (ss.ss_family == AF_INET)
+				inet_pton(AF_INET, "127.0.0.1", &((struct sockaddr_in *)&ss)->sin_addr);
+			else
+				inet_pton(AF_INET6, "::1", &((struct sockaddr_in6 *)&ss)->sin6_addr);
 		}
 	} else {
 		usage("invalid protocol family");
 	}
 
-	if ((s = socket(ss.ss_family, SOCK_STREAM, 0)) == -1)
+	s = socket(ss.ss_family, SOCK_STREAM, 0);
+	if (s == -1)
 		err(1, "socket");
+
 	if (servermode) {
-		if (bind(s, (const struct sockaddr*)&ss, slen) == -1)
+		if (bind(s, (struct sockaddr *)&ss, slen) == -1)
 			err(1, "bind");
 		if (listen(s, 10) == -1)
 			err(1, "listen");
@@ -341,11 +285,10 @@ main(int argc, char **argv) {
 	} else {
 		int flags = fcntl(s, F_GETFL);
 		fcntl(s, F_SETFL, flags | O_NONBLOCK);
-		if (connect(s, (const struct sockaddr*)&ss, slen) == -1 && errno != EINPROGRESS)
+		if (connect(s, (struct sockaddr *)&ss, slen) == -1 && errno != EINPROGRESS)
 			err(1, "connect");
 		client_loop(s, nlines);
 	}
 	close(s);
-
 	return 0;
 }
